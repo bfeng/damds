@@ -1,9 +1,15 @@
 package edu.indiana.soic.spidal.damds;
 
-import java.io.*;
+import mpi.MPI;
+import mpi.MPIException;
+
+import java.io.FileWriter;
+import java.io.IOException;
+import java.io.PrintWriter;
 import java.text.DecimalFormat;
-import java.util.HashMap;
-import java.util.Map;
+
+import static edu.indiana.soic.spidal.damds.ParallelOps.worldProcRank;
+import static edu.indiana.soic.spidal.damds.ParallelOps.worldProcsCount;
 
 public class Utils {
 
@@ -59,5 +65,19 @@ public class Utils {
         Process p = Runtime.getRuntime().exec(cmd);
         p.getInputStream().read(bo);
         return new String(bo);
+    }
+
+    static void allPrintln(final String msg) {
+        try {
+            MPI.COMM_WORLD.barrier();
+            for (int i = 0; i < worldProcsCount; i++) {
+                MPI.COMM_WORLD.barrier();
+                if (worldProcRank == i)
+                    System.out.println(String.format("Rank[%02d/%02d]:%s", worldProcRank, worldProcsCount, msg));
+            }
+            MPI.COMM_WORLD.barrier();
+        } catch (MPIException e) {
+            e.printStackTrace();
+        }
     }
 }

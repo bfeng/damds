@@ -3,6 +3,9 @@ package edu.indiana.soic.spidal.damds;
 import com.google.common.base.Optional;
 import com.google.common.base.Stopwatch;
 import com.google.common.base.Strings;
+import edu.indiana.sice.dscspidal.mpicommonio.Sparse;
+import edu.indiana.sice.dscspidal.mpicommonio.SparseMatrix;
+import edu.indiana.sice.dscspidal.mpicommonio.SparseMatrixFile;
 import edu.indiana.soic.spidal.common.*;
 import edu.indiana.soic.spidal.configuration.section.DAMDSSection;
 import edu.indiana.soic.spidal.damds.threads.ThreadCommunicator;
@@ -19,7 +22,10 @@ import java.nio.file.Files;
 import java.nio.file.Paths;
 import java.nio.file.StandardOpenOption;
 import java.text.DecimalFormat;
-import java.util.*;
+import java.util.Arrays;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.Random;
 import java.util.concurrent.BrokenBarrierException;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.locks.Lock;
@@ -29,36 +35,27 @@ public class ProgramWorker {
     // Constants
     private final double INV_SHORT_MAX = 1.0 / Short.MAX_VALUE;
     private final double SHORT_MAX = Short.MAX_VALUE;
-
+    final private RefObj<Integer> refInt = new RefObj<>();
+    final private RefObj<Double> refDouble = new RefObj<>();
     // Calculated Constants
     private double INV_SUM_OF_SQUARE;
-
     // Arrays
     private double[] preX;
     private double[] BC;
     private double[] MMr;
     private double[] MMAp;
-
     private double[][] threadPartialBofZ;
     private double[] threadPartialMM;
-
     private double[] v;
-
     //Config Settings
     private DAMDSSection config;
     private ByteOrder byteOrder;
-    private short[] distances;
+    private SparseMatrix distanceMatrix;
     private WeightsWrap1D weights;
-
     private int BlockSize;
-
     private int threadId;
     private Range globalThreadRowRange;
     private Range threadLocalRowRange;
-
-    final private RefObj<Integer> refInt = new RefObj<>();
-    final private RefObj<Double> refDouble = new RefObj<>();
-
     private ThreadCommunicator threadComm;
     private Utils utils;
     private Stopwatch mainTimer;
@@ -101,325 +98,6 @@ public class ProgramWorker {
         temperatureLoopTimings = new TemperatureLoopTimings();
     }
 
-    public void setup() {
-        final int threadRowCount = ParallelOps.threadRowCounts[threadId];
-        final int threadLocalRowStartOffset =
-                ParallelOps.threadRowStartOffsets[threadId];
-        final int globalThreadRowStartOffset = ParallelOps.procRowStartOffset
-                + threadLocalRowStartOffset;
-        globalThreadRowRange = new Range(
-                globalThreadRowStartOffset, globalThreadRowStartOffset +
-                threadRowCount - 1);
-        threadLocalRowRange = new Range(
-                threadLocalRowStartOffset, (
-                threadLocalRowStartOffset + threadRowCount - 1));
-
-        if (lock != null) {
-            lock.lock();
-        }
-        long threadLocalMmapXWriteByteOffset =
-                ((ParallelOps.procRowStartOffset -
-                        ParallelOps.procRowRanges[ParallelOps.mmapLeadWorldRank]
-                                .getStartIndex()) + ParallelOps
-                        .threadRowStartOffsets[threadId])
-                        * config.targetDimension * Double.BYTES;
-        int threadLocalMmapXWriteByteExtent = ParallelOps
-                .threadRowCounts[threadId] *
-                config.targetDimension * Double
-                .BYTES;
-        threadLocalMmapXWriteBytes = ParallelOps.mmapXReadBytes.slice
-                (threadLocalMmapXWriteByteOffset, threadLocalMmapXWriteByteExtent);
-
-        threadLocalFullXBytes = ParallelOps.fullXBytes.slice(0, config.numberDataPoints *
-                config.targetDimension * Double.BYTES);
-
-
-
-        if (lock != null) {
-            lock.unlock();
-        }
-    }
-
-    public void run() throws IOException {
-        try {
-            setup();
-            readDistancesAndWeights(config.isSammon);
-            /*System.out.println("Rank " + ParallelOps.worldProcRank + " " +
-                    "TID " + threadId + "Came " +
-                    "here ");*/
-
-            RefObj<Integer> missingDistCount = new RefObj<>();
-            DoubleStatistics distanceSummary = calculateStatistics(
-                    distances, weights, missingDistCount);
-            double missingDistPercent = missingDistCount.getValue() /
-                    (Math.pow(config.numberDataPoints, 2));
-            INV_SUM_OF_SQUARE = 1.0 / distanceSummary.getSumOfSquare();
-            utils.printMessage(
-                    "\nDistance summary... \n" + distanceSummary.toString() +
-                            "\n  MissingDistPercentage=" +
-                            missingDistPercent);
-
-            weights.setAvgDistForSammon(distanceSummary.getAverage());
-            changeZeroDistancesToPostiveMin(distances, distanceSummary
-                    .getPositiveMin());
-
-            // Allocating point arrays once for all
-            allocateArrays();
-
-            if (Strings.isNullOrEmpty(config.initialPointsFile)) {
-                generateInitMapping(
-                        config.numberDataPoints, config.targetDimension, preX);
-            } else {
-                readInitMapping(config.initialPointsFile, preX, config
-                        .targetDimension);
-            }
-
-
-            double tCur = 0.0;
-            double tMax = distanceSummary.getMax() / Math.sqrt(2.0 * config
-                    .targetDimension);
-            double tMin = config.tMinFactor * distanceSummary.getPositiveMin
-                    () / Math.sqrt(2.0 * config.targetDimension);
-
-            generateV(distances, weights, v);
-            double preStress = calculateStress(
-                    preX, config.targetDimension, tCur, distances, weights,
-                    INV_SUM_OF_SQUARE);
-            utils.printMessage("\nInitial stress=" + preStress);
-
-            tCur = config.alpha * tMax;
-
-            // TODO - turning off barriers
-            /*if (threadId == 0) {
-                ParallelOps.worldProcsComm.barrier();
-            }
-            threadComm.barrier();*/
-            if (threadId == 0) {
-                mainTimer.stop();
-                utils.printMessage("\nUp to the loop took " + mainTimer.elapsed(
-                        TimeUnit.SECONDS) + " seconds");
-                mainTimer.start();
-            }
-
-            Stopwatch loopTimer = Stopwatch.createStarted();
-
-            int loopNum = 0;
-            double diffStress;
-            double stress = -1.0;
-            RefObj<Integer> outRealCGIterations = new RefObj<>(0);
-            RefObj<Integer> cgCount = new RefObj<>(0);
-            int smacofRealIterations = 0;
-            while (true) {
-
-                temperatureLoopTimings.startTiming(
-                        TemperatureLoopTimings.TimingTask.PRE_STRESS);
-                preStress = calculateStress(
-                        preX, config.targetDimension, tCur, distances, weights,
-                        INV_SUM_OF_SQUARE);
-                temperatureLoopTimings.endTiming(
-                        TemperatureLoopTimings.TimingTask.PRE_STRESS);
-
-                diffStress = config.threshold + 1.0;
-
-                utils.printMessage(
-                        String.format(
-                                "\nStart of loop %d Temperature (T_Cur) %.5g",
-                                loopNum, tCur));
-
-                int itrNum = 0;
-                cgCount.setValue(0);
-                temperatureLoopTimings.startTiming(
-                        TemperatureLoopTimings.TimingTask.STRESS_LOOP);
-                while (diffStress >= config.threshold) {
-
-                    zeroOutArray(threadPartialMM);
-                    stressLoopTimings.startTiming(
-                            StressLoopTimings.TimingTask.BC);
-                    calculateBC(
-                            preX, config.targetDimension, tCur, distances,
-                            weights, BlockSize, BC, threadPartialBofZ,
-                            threadPartialMM);
-                    stressLoopTimings.endTiming(
-                            StressLoopTimings.TimingTask.BC);
-
-                    // TODO - turning off barriers
-                    /*if (threadId == 0) {
-                        // This barrier was necessary for correctness when using
-                        // a single mmap file
-                        ParallelOps.worldProcsComm.barrier();
-                    }
-                    threadComm.barrier();*/
-
-                    stressLoopTimings.startTiming(
-                            StressLoopTimings.TimingTask.CG);
-                    calculateConjugateGradient(preX, config.targetDimension,
-                            config.numberDataPoints,
-                            BC,
-                            config.cgIter,
-                            config.cgErrorThreshold, cgCount,
-                            outRealCGIterations, weights,
-                            BlockSize, v, MMr, MMAp, threadPartialMM);
-                    stressLoopTimings.endTiming(
-                            StressLoopTimings.TimingTask.CG);
-
-
-                    stressLoopTimings.startTiming(
-                            StressLoopTimings.TimingTask.STRESS);
-                    stress = calculateStress(
-                            preX, config.targetDimension, tCur, distances,
-                            weights,
-                            INV_SUM_OF_SQUARE);
-                    stressLoopTimings.endTiming(
-                            StressLoopTimings.TimingTask.STRESS);
-
-                    diffStress = preStress - stress;
-                    preStress = stress;
-
-                    if ((itrNum % 10 == 0) || (itrNum >= config.stressIter)) {
-                        utils.printMessage(
-                                String.format(
-                                        "  Loop %d Iteration %d Avg CG count " +
-                                                "%.5g " +
-                                                "Stress " +
-                                                "%.5g", loopNum, itrNum,
-                                        (cgCount.getValue() * 1.0 / (itrNum +
-                                                1)),
-                                        stress));
-                    }
-                    ++itrNum;
-                    ++smacofRealIterations;
-                }
-                temperatureLoopTimings.endTiming(
-                        TemperatureLoopTimings.TimingTask.STRESS_LOOP);
-
-                --itrNum;
-                if (itrNum >= 0 && !(itrNum % 10 == 0) && !(itrNum >=
-                        config.stressIter)) {
-                    utils.printMessage(
-                            String.format(
-                                    "  Loop %d Iteration %d Avg CG count %.5g" +
-                                            " " +
-                                            "Stress %.5g",
-                                    loopNum, itrNum,
-                                    (cgCount.getValue() * 1.0 / (itrNum + 1))
-                                    , stress));
-                }
-
-                utils.printMessage(
-                        String.format(
-                                "End of loop %d Total Iterations %d Avg CG " +
-                                        "count %.5g" +
-                                        " Stress %.5g",
-                                loopNum, (itrNum + 1),
-                                (cgCount.getValue() * 1.0 / (itrNum + 1)),
-                                stress));
-
-                if (tCur == 0)
-                    break;
-                tCur *= config.alpha;
-                if (tCur < tMin)
-                    tCur = 0;
-                ++loopNum;
-
-                /* Note - quick way to test programs without running full
-                * number of temperature loops */
-                if (config.maxtemploops > 0 && loopNum == config.maxtemploops) {
-                    break;
-                }
-            }
-            loopTimer.stop();
-
-            double QoR1 = stress / (config.numberDataPoints * (config
-                    .numberDataPoints - 1) / 2);
-            double QoR2 = QoR1 / (distanceSummary.getAverage() *
-                    distanceSummary.getAverage());
-
-            utils.printMessage(
-                    String.format(
-                            "Normalize1 = %.5g Normalize2 = %.5g", QoR1, QoR2));
-            utils.printMessage(
-                    String.format(
-                            "Average of Delta(original distance) = %.5g",
-                            distanceSummary.getAverage()));
-
-            Double finalStress = calculateStress(
-                    preX, config.targetDimension, tCur, distances, weights,
-                    INV_SUM_OF_SQUARE);
-
-            if (threadId == 0) {
-                if (ParallelOps.worldProcRank == 0){
-                    Utils.writeOutput(preX, Program.config.targetDimension, Program.config.pointsFile);
-                }
-                mainTimer.stop();
-            }
-
-            utils.printMessage("Finishing DAMDS run ...");
-            long totalTime = mainTimer.elapsed(TimeUnit.MILLISECONDS);
-            long temperatureLoopTime = loopTimer.elapsed(TimeUnit.MILLISECONDS);
-            utils.printMessage(
-                    String.format(
-                            "  Total Time: %s (%d ms) Loop Time: %s (%d ms)",
-                            formatElapsedMillis(totalTime), totalTime,
-                            formatElapsedMillis(temperatureLoopTime),
-                            temperatureLoopTime));
-            utils.printMessage("  Total Loops: " + loopNum);
-            utils.printMessage("  Total Iterations: " + smacofRealIterations);
-            utils.printMessage(
-                    String.format(
-                            "  Total CG Iterations: %d Avg. CG Iterations: %" +
-                                    ".5g",
-                            outRealCGIterations.getValue(),
-                            (outRealCGIterations.getValue() * 1.0) /
-                                    smacofRealIterations));
-            utils.printMessage("  Final Stress:\t" + finalStress);
-            // TODO - fix print timings
-            /*printTimings(totalTime, temperatureLoopTime);*/
-            printTimingDistributions();
-            threadComm.barrier();
-        } catch (MPIException e) {
-            utils.printAndThrowRuntimeException(new RuntimeException(e));
-        } catch (InterruptedException | BrokenBarrierException e) {
-            e.printStackTrace();
-        }
-    }
-
-    private void printTimingDistributions() throws BrokenBarrierException, InterruptedException, MPIException {
-        double [] mmInternalTimings = new double[ParallelOps.threadCount];
-        System.arraycopy(threadComm.gatherDoublesOverThreads(threadId, mmTimings.getTotalTime(MMTimings.TimingTask.MM_INTERNAL)), 0, mmInternalTimings, 0, ParallelOps.threadCount);
-
-        threadComm.barrier();
-        double [] bcInternalTimings = new double[ParallelOps.threadCount];
-        System.arraycopy(threadComm.gatherDoublesOverThreads(threadId, bcTimings.getTotalTime(BCTimings.TimingTask.BC_INTERNAL)), 0, bcInternalTimings, 0, ParallelOps.threadCount);
-
-        if (ParallelOps.worldProcsCount > 1 && threadId == 0) {
-            double[] tmp = ParallelOps.allGather(mmInternalTimings);
-            mmInternalTimings = new double[ParallelOps.threadCount * ParallelOps.worldProcsCount];
-            System.arraycopy(tmp, 0, mmInternalTimings, 0, mmInternalTimings.length);
-            tmp = ParallelOps.allGather(bcInternalTimings);
-            bcInternalTimings = new double[ParallelOps.threadCount * ParallelOps.worldProcsCount];
-            System.arraycopy(tmp, 0, bcInternalTimings, 0, bcInternalTimings.length);
-        }
-
-        if (ParallelOps.worldProcRank == 0 && threadId == 0){
-            try (BufferedWriter writer = Files.newBufferedWriter(
-                    Paths.get(config.timingFile), StandardOpenOption.WRITE,
-                    StandardOpenOption.CREATE)) {
-                PrintWriter printWriter = new PrintWriter(writer, true);
-                prettyPrintArray("BCInternalMM Timing Distribution",
-                        bcInternalTimings, printWriter);
-                prettyPrintArray("MMInternal Timing Distribution",
-                        mmInternalTimings, printWriter);
-
-                printWriter.flush();
-                printWriter.close();
-
-            } catch (IOException e) {
-                e.printStackTrace();
-            }
-        }
-
-    }
-
     private static void prettyPrintArray(
             String title, double[] vals, PrintWriter printWriter) {
         String str;
@@ -428,44 +106,6 @@ public class ProgramWorker {
         printWriter.println(
                 str.substring(1, str.length() - 1).replace(',', '\t'));
         printWriter.println();
-    }
-
-    private void allocateArrays() {
-        // Allocating point arrays once for all
-        final int numberDataPoints = config.numberDataPoints;
-        final int targetDimension = config.targetDimension;
-
-        preX = new double[numberDataPoints * targetDimension];
-        BC = new double[numberDataPoints * targetDimension];
-        MMr = new double[numberDataPoints * targetDimension];
-        MMAp = new double[numberDataPoints * targetDimension];
-        final int threadRowCount = ParallelOps.threadRowCounts[threadId];
-        threadPartialBofZ = new double[threadRowCount][ParallelOps
-                .globalColCount];
-        threadPartialMM = new double[threadRowCount
-                * config.targetDimension];
-        v = new double[threadRowCount];
-    }
-
-    private void zeroOutArray(double[] a) {
-        Arrays.fill(a, 0.0d);
-    }
-
-    private void zeroOutArray(double[][] a) {
-        for (int j = 0; j < ParallelOps.threadRowCounts[threadId]; ++j) {
-            Arrays.fill(a[j], 0.0d);
-        }
-    }
-
-    private void changeZeroDistancesToPostiveMin(
-            short[] distances, double positiveMin) {
-        double tmpD;
-        for (int i = 0; i < distances.length; ++i) {
-            tmpD = distances[i] * INV_SHORT_MAX;
-            if (tmpD < positiveMin && tmpD >= 0.0) {
-                distances[i] = (short) (positiveMin * SHORT_MAX);
-            }
-        }
     }
 
     private static long[] getTemperatureLoopTimeDistribution(
@@ -480,40 +120,6 @@ public class ProgramWorker {
         return mpiOnlyTimingArray;
     }
 
-    private void readInitMapping(
-            String initialPointsFile, double[] preX, int dimension)
-            throws BrokenBarrierException, InterruptedException {
-        if (threadId == 0) {
-            try (BufferedReader br = Files
-                    .newBufferedReader(Paths.get(initialPointsFile),
-                            Charset.defaultCharset())) {
-                String line;
-                Pattern pattern = Pattern.compile("[\t]");
-                int row = 0;
-                while ((line = br.readLine()) != null) {
-
-                    if (Strings.isNullOrEmpty(line)) {
-                        continue; // continue on empty lines - "while" will
-                    }
-                    // break on null anyway;
-
-                    String[] splits = pattern.split(line.trim());
-
-                    for (int i = 0; i < dimension; ++i) {
-                        preX[row + i] = Double.parseDouble(splits[i].trim());
-                    }
-                    row += dimension;
-
-                }
-            } catch (Exception e) {
-                throw new RuntimeException(e);
-            }
-
-        }
-        threadComm.barrier();
-        threadComm.bcastDoubleArrayOverThreads(threadId, preX, 0);
-    }
-
     public static String formatElapsedMillis(long elapsed) {
         String format = "%dd:%02dH:%02dM:%02dS:%03dmS";
         short millis = (short) (elapsed % (1000.0));
@@ -526,8 +132,6 @@ public class ProgramWorker {
         long days = (elapsed - hours) / 24; // remaining elapsed in days
         return String.format(format, days, hours, minutes, seconds, millis);
     }
-
-
 
     private static void writeOuput(double[] X, int vecLen, String labelFile,
                                    String outputFile) throws IOException {
@@ -571,8 +175,456 @@ public class ProgramWorker {
         writer.close();
     }
 
-    private void generateV(
-            short[] distances, WeightsWrap1D weights, double[] v) {
+    private static double innerProductCalculation(double[] a, double[] b) {
+        double sum = 0;
+        if (a.length > 0) {
+            for (int i = 0; i < a.length; ++i) {
+                sum += a[i] * b[i];
+            }
+        }
+        return sum;
+    }
+
+    private static double innerProductCalculation(double[] a) {
+        double sum = 0.0;
+        if (a.length > 0) {
+            for (double anA : a) {
+                sum += anA * anA;
+            }
+        }
+        return sum;
+    }
+
+    private static void extractPoints(Bytes bytes, int numPoints, int dimension, double[] to) {
+        int pos = 0;
+        int offset;
+        for (int i = 0; i < numPoints; ++i) {
+            offset = i * dimension;
+            for (int j = 0; j < dimension; ++j) {
+                bytes.position(pos);
+                to[offset + j] = bytes.readDouble(pos);
+                pos += Double.BYTES;
+            }
+        }
+    }
+
+    private static void mergePartials(double[][] partials, double[] result) {
+        int offset = 0;
+        for (double[] partial : partials) {
+            System.arraycopy(partial, 0, result, offset, partial.length);
+            offset += partial.length;
+        }
+    }
+
+    private static void mergePartials(
+            double[][] partials, Bytes result) {
+        result.position(0);
+        for (double[] partial : partials) {
+            for (double aPartial : partial) {
+                result.writeDouble(aPartial);
+            }
+        }
+    }
+
+    private static TransformationFunction loadFunction(String classFile) {
+        ClassLoader classLoader = Program.class.getClassLoader();
+        try {
+            Class aClass = classLoader.loadClass(classFile);
+            return (TransformationFunction) aClass.newInstance();
+        } catch (ClassNotFoundException | InstantiationException |
+                IllegalAccessException e) {
+            throw new RuntimeException("Failed to load class: " + classFile, e);
+        }
+    }
+
+    /**
+     * Parse command line arguments
+     *
+     * @param args Command line arguments
+     * @param opts Command line options
+     * @return An <code>Optional&lt;CommandLine&gt;</code> object
+     */
+    private static Optional<CommandLine> parseCommandLineArguments(
+            String[] args, Options opts) {
+
+        CommandLineParser optParser = new GnuParser();
+
+        try {
+            return Optional.fromNullable(optParser.parse(opts, args));
+        } catch (ParseException e) {
+            e.printStackTrace();
+        }
+        return Optional.fromNullable(null);
+    }
+
+    public void setup() {
+        final int threadRowCount = ParallelOps.threadRowCounts[threadId];
+        final int threadLocalRowStartOffset =
+                ParallelOps.threadRowStartOffsets[threadId];
+        final int globalThreadRowStartOffset = ParallelOps.procRowStartOffset
+                + threadLocalRowStartOffset;
+        globalThreadRowRange = new Range(
+                globalThreadRowStartOffset, globalThreadRowStartOffset +
+                threadRowCount - 1);
+        threadLocalRowRange = new Range(
+                threadLocalRowStartOffset, (
+                threadLocalRowStartOffset + threadRowCount - 1));
+
+        if (lock != null) {
+            lock.lock();
+        }
+        long threadLocalMmapXWriteByteOffset =
+                ((ParallelOps.procRowStartOffset -
+                        ParallelOps.procRowRanges[ParallelOps.mmapLeadWorldRank]
+                                .getStartIndex()) + ParallelOps
+                        .threadRowStartOffsets[threadId])
+                        * config.targetDimension * Double.BYTES;
+        int threadLocalMmapXWriteByteExtent = ParallelOps
+                .threadRowCounts[threadId] *
+                config.targetDimension * Double
+                .BYTES;
+        threadLocalMmapXWriteBytes = ParallelOps.mmapXReadBytes.slice
+                (threadLocalMmapXWriteByteOffset, threadLocalMmapXWriteByteExtent);
+
+        threadLocalFullXBytes = ParallelOps.fullXBytes.slice(0, config.numberDataPoints *
+                config.targetDimension * Double.BYTES);
+
+
+        if (lock != null) {
+            lock.unlock();
+        }
+    }
+
+    public void run() throws IOException {
+        try {
+            setup();
+            Utils.allPrintln(String.format("Before read: distanceMatrix=%s", distanceMatrix));
+            if (!Strings.isNullOrEmpty(config.sparseScoreIndexFile) && !Strings.isNullOrEmpty(config.sparseScoreDataFile)) {
+                readScoreMatrixAndWeight();
+            } else {
+                readDistancesAndWeights(config.isSammon);
+            }
+            Utils.allPrintln(String.format("After read:  distanceMatrix=%dx%d", distanceMatrix.numRows(), distanceMatrix.numCols()));
+            Utils.allPrintln(String.format("After read:  distanceMatrix.nnz=%d, distanceMatrix.sparsity=%.8f", distanceMatrix.nnz(), distanceMatrix.sparsity()));
+
+            /*System.out.println("Rank " + ParallelOps.worldProcRank + " " +
+                    "TID " + threadId + "Came " +
+                    "here ");*/
+
+            RefObj<Integer> missingDistCount = new RefObj<>();
+            DoubleStatistics distanceSummary = calculateStatistics(weights, missingDistCount);
+            double missingDistPercent = missingDistCount.getValue() / (Math.pow(config.numberDataPoints, 2));
+            INV_SUM_OF_SQUARE = 1.0 / distanceSummary.getSumOfSquare();
+            utils.printMessage(
+                    "\nDistance summary... \n" + distanceSummary.toString() +
+                            "\n  MissingDistPercentage=" +
+                            missingDistPercent);
+
+            weights.setAvgDistForSammon(distanceSummary.getAverage());
+//            changeZeroDistancesToPostiveMin(distanceSummary.getPositiveMin());
+
+            // Allocating point arrays once for all
+            allocateArrays();
+
+            if (Strings.isNullOrEmpty(config.initialPointsFile)) {
+                generateInitMapping(
+                        config.numberDataPoints, config.targetDimension, preX);
+            } else {
+                readInitMapping(config.initialPointsFile, preX, config
+                        .targetDimension);
+            }
+
+
+            double tCur = 0.0;
+            double tMax = distanceSummary.getMax() / Math.sqrt(2.0 * config.targetDimension);
+            double tMin = config.tMinFactor * distanceSummary.getPositiveMin() / Math.sqrt(2.0 * config.targetDimension);
+
+            generateV(weights, v);
+            double preStress = calculateStress(preX, config.targetDimension, tCur, weights, INV_SUM_OF_SQUARE);
+            utils.printMessage("\nInitial stress=" + preStress);
+
+            tCur = config.alpha * tMax;
+
+            // TODO - turning off barriers
+            /*if (threadId == 0) {
+                ParallelOps.worldProcsComm.barrier();
+            }
+            threadComm.barrier();*/
+            if (threadId == 0) {
+                mainTimer.stop();
+                utils.printMessage("\nUp to the loop took " + mainTimer.elapsed(TimeUnit.SECONDS) + " seconds");
+                mainTimer.start();
+            }
+
+            Stopwatch loopTimer = Stopwatch.createStarted();
+
+            int loopNum = 0;
+            double diffStress;
+            double stress = -1.0;
+            RefObj<Integer> outRealCGIterations = new RefObj<>(0);
+            RefObj<Integer> cgCount = new RefObj<>(0);
+            int smacofRealIterations = 0;
+
+            Utils.allPrintln(String.format("Before loop:  distanceMatrix.nnz=%d, distanceMatrix.sparsity=%.8f", distanceMatrix.nnz(), distanceMatrix.sparsity()));
+            while (true) {
+
+                temperatureLoopTimings.startTiming(TemperatureLoopTimings.TimingTask.PRE_STRESS);
+                preStress = calculateStress(preX, config.targetDimension, tCur, weights, INV_SUM_OF_SQUARE);
+                temperatureLoopTimings.endTiming(TemperatureLoopTimings.TimingTask.PRE_STRESS);
+
+                diffStress = config.threshold + 1.0;
+
+                utils.printMessage(String.format("\nStart of loop %d Temperature (T_Cur) %.5g", loopNum, tCur));
+
+                int itrNum = 0;
+                cgCount.setValue(0);
+                temperatureLoopTimings.startTiming(TemperatureLoopTimings.TimingTask.STRESS_LOOP);
+                while (diffStress >= config.threshold) {
+
+                    zeroOutArray(threadPartialMM);
+                    stressLoopTimings.startTiming(StressLoopTimings.TimingTask.BC);
+                    calculateBC(preX, config.targetDimension, tCur, weights, BlockSize, BC, threadPartialBofZ, threadPartialMM);
+                    stressLoopTimings.endTiming(StressLoopTimings.TimingTask.BC);
+
+                    // TODO - turning off barriers
+                    /*if (threadId == 0) {
+                        // This barrier was necessary for correctness when using
+                        // a single mmap file
+                        ParallelOps.worldProcsComm.barrier();
+                    }
+                    threadComm.barrier();*/
+
+                    stressLoopTimings.startTiming(StressLoopTimings.TimingTask.CG);
+                    calculateConjugateGradient(preX, config.targetDimension,
+                            config.numberDataPoints,
+                            BC,
+                            config.cgIter,
+                            config.cgErrorThreshold, cgCount,
+                            outRealCGIterations, weights,
+                            BlockSize, v, MMr, MMAp, threadPartialMM);
+                    stressLoopTimings.endTiming(StressLoopTimings.TimingTask.CG);
+
+
+                    stressLoopTimings.startTiming(StressLoopTimings.TimingTask.STRESS);
+                    stress = calculateStress(preX, config.targetDimension, tCur, weights, INV_SUM_OF_SQUARE);
+                    stressLoopTimings.endTiming(StressLoopTimings.TimingTask.STRESS);
+
+                    diffStress = preStress - stress;
+                    preStress = stress;
+
+                    if ((itrNum % 10 == 0) || (itrNum >= config.stressIter)) {
+                        utils.printMessage(
+                                String.format(
+                                        "  Loop %d Iteration %d Avg CG count " +
+                                                "%.5g " +
+                                                "Stress " +
+                                                "%.5g", loopNum, itrNum,
+                                        (cgCount.getValue() * 1.0 / (itrNum +
+                                                1)),
+                                        stress));
+                    }
+                    ++itrNum;
+                    ++smacofRealIterations;
+                }
+                temperatureLoopTimings.endTiming(TemperatureLoopTimings.TimingTask.STRESS_LOOP);
+
+                --itrNum;
+                if (itrNum >= 0 && !(itrNum % 10 == 0) && !(itrNum >= config.stressIter)) {
+                    utils.printMessage(
+                            String.format(
+                                    "  Loop %d Iteration %d Avg CG count %.5g" +
+                                            " " +
+                                            "Stress %.5g",
+                                    loopNum, itrNum,
+                                    (cgCount.getValue() * 1.0 / (itrNum + 1))
+                                    , stress));
+                }
+
+                utils.printMessage(
+                        String.format(
+                                "End of loop %d Total Iterations %d Avg CG " +
+                                        "count %.5g" +
+                                        " Stress %.5g",
+                                loopNum, (itrNum + 1),
+                                (cgCount.getValue() * 1.0 / (itrNum + 1)),
+                                stress));
+
+                if (tCur == 0)
+                    break;
+                tCur *= config.alpha;
+                if (tCur < tMin)
+                    tCur = 0;
+                ++loopNum;
+
+                /* Note - quick way to test programs without running full
+                 * number of temperature loops */
+                if (config.maxtemploops > 0 && loopNum == config.maxtemploops) {
+                    break;
+                }
+            }
+            loopTimer.stop();
+
+            double QoR1 = stress / (config.numberDataPoints * (config.numberDataPoints - 1) / 2);
+            double QoR2 = QoR1 / (distanceSummary.getAverage() * distanceSummary.getAverage());
+
+            utils.printMessage(
+                    String.format(
+                            "Normalize1 = %.5g Normalize2 = %.5g", QoR1, QoR2));
+            utils.printMessage(
+                    String.format(
+                            "Average of Delta(original distance) = %.5g",
+                            distanceSummary.getAverage()));
+
+            Double finalStress = calculateStress(preX, config.targetDimension, tCur, weights, INV_SUM_OF_SQUARE);
+
+            if (threadId == 0) {
+                if (ParallelOps.worldProcRank == 0) {
+                    Utils.writeOutput(preX, Program.config.targetDimension, Program.config.pointsFile);
+                }
+                mainTimer.stop();
+            }
+
+            utils.printMessage("Finishing DAMDS run ...");
+            long totalTime = mainTimer.elapsed(TimeUnit.MILLISECONDS);
+            long temperatureLoopTime = loopTimer.elapsed(TimeUnit.MILLISECONDS);
+            utils.printMessage(
+                    String.format(
+                            "  Total Time: %s (%d ms) Loop Time: %s (%d ms)",
+                            formatElapsedMillis(totalTime), totalTime,
+                            formatElapsedMillis(temperatureLoopTime),
+                            temperatureLoopTime));
+            utils.printMessage("  Total Loops: " + loopNum);
+            utils.printMessage("  Total Iterations: " + smacofRealIterations);
+            utils.printMessage(
+                    String.format(
+                            "  Total CG Iterations: %d Avg. CG Iterations: %" +
+                                    ".5g",
+                            outRealCGIterations.getValue(),
+                            (outRealCGIterations.getValue() * 1.0) /
+                                    smacofRealIterations));
+            utils.printMessage("  Final Stress:\t" + finalStress);
+            // TODO - fix print timings
+            /*printTimings(totalTime, temperatureLoopTime);*/
+            printTimingDistributions();
+            threadComm.barrier();
+        } catch (MPIException e) {
+            utils.printAndThrowRuntimeException(new RuntimeException(e));
+        } catch (InterruptedException | BrokenBarrierException e) {
+            e.printStackTrace();
+        }
+    }
+
+    private void printTimingDistributions() throws BrokenBarrierException, InterruptedException, MPIException {
+        double[] mmInternalTimings = new double[ParallelOps.threadCount];
+        System.arraycopy(threadComm.gatherDoublesOverThreads(threadId, mmTimings.getTotalTime(MMTimings.TimingTask.MM_INTERNAL)), 0, mmInternalTimings, 0, ParallelOps.threadCount);
+
+        threadComm.barrier();
+        double[] bcInternalTimings = new double[ParallelOps.threadCount];
+        System.arraycopy(threadComm.gatherDoublesOverThreads(threadId, bcTimings.getTotalTime(BCTimings.TimingTask.BC_INTERNAL)), 0, bcInternalTimings, 0, ParallelOps.threadCount);
+
+        if (ParallelOps.worldProcsCount > 1 && threadId == 0) {
+            double[] tmp = ParallelOps.allGather(mmInternalTimings);
+            mmInternalTimings = new double[ParallelOps.threadCount * ParallelOps.worldProcsCount];
+            System.arraycopy(tmp, 0, mmInternalTimings, 0, mmInternalTimings.length);
+            tmp = ParallelOps.allGather(bcInternalTimings);
+            bcInternalTimings = new double[ParallelOps.threadCount * ParallelOps.worldProcsCount];
+            System.arraycopy(tmp, 0, bcInternalTimings, 0, bcInternalTimings.length);
+        }
+
+        if (ParallelOps.worldProcRank == 0 && threadId == 0) {
+            try (BufferedWriter writer = Files.newBufferedWriter(
+                    Paths.get(config.timingFile), StandardOpenOption.WRITE,
+                    StandardOpenOption.CREATE)) {
+                PrintWriter printWriter = new PrintWriter(writer, true);
+                prettyPrintArray("BCInternalMM Timing Distribution",
+                        bcInternalTimings, printWriter);
+                prettyPrintArray("MMInternal Timing Distribution",
+                        mmInternalTimings, printWriter);
+
+                printWriter.flush();
+                printWriter.close();
+
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
+        }
+
+    }
+
+    private void allocateArrays() {
+        // Allocating point arrays once for all
+        final int numberDataPoints = config.numberDataPoints;
+        final int targetDimension = config.targetDimension;
+
+        preX = new double[numberDataPoints * targetDimension];
+        BC = new double[numberDataPoints * targetDimension];
+        MMr = new double[numberDataPoints * targetDimension];
+        MMAp = new double[numberDataPoints * targetDimension];
+        final int threadRowCount = ParallelOps.threadRowCounts[threadId];
+        threadPartialBofZ = new double[threadRowCount][ParallelOps
+                .globalColCount];
+        threadPartialMM = new double[threadRowCount
+                * config.targetDimension];
+        v = new double[threadRowCount];
+    }
+
+    private void zeroOutArray(double[] a) {
+        Arrays.fill(a, 0.0d);
+    }
+
+    private void zeroOutArray(double[][] a) {
+        for (int j = 0; j < ParallelOps.threadRowCounts[threadId]; ++j) {
+            Arrays.fill(a[j], 0.0d);
+        }
+    }
+
+    private void changeZeroDistancesToPostiveMin(double positiveMin) {
+        double tmpD;
+        for (int i = 0; i < distanceMatrix.numRows(); i++) {
+            for (int j = 0; j < distanceMatrix.numCols(); j++) {
+                tmpD = distanceMatrix.get(i, j) * INV_SHORT_MAX;
+                if (tmpD < positiveMin && tmpD >= 0.0) {
+                    distanceMatrix.set(i, j, (positiveMin * SHORT_MAX));
+                }
+            }
+        }
+    }
+
+    private void readInitMapping(
+            String initialPointsFile, double[] preX, int dimension)
+            throws BrokenBarrierException, InterruptedException {
+        if (threadId == 0) {
+            try (BufferedReader br = Files
+                    .newBufferedReader(Paths.get(initialPointsFile),
+                            Charset.defaultCharset())) {
+                String line;
+                Pattern pattern = Pattern.compile("[\t]");
+                int row = 0;
+                while ((line = br.readLine()) != null) {
+
+                    if (Strings.isNullOrEmpty(line)) {
+                        continue; // continue on empty lines - "while" will
+                    }
+                    // break on null anyway;
+
+                    String[] splits = pattern.split(line.trim());
+
+                    for (int i = 0; i < dimension; ++i) {
+                        preX[row + i] = Double.parseDouble(splits[i].trim());
+                    }
+                    row += dimension;
+
+                }
+            } catch (Exception e) {
+                throw new RuntimeException(e);
+            }
+
+        }
+        threadComm.barrier();
+        threadComm.bcastDoubleArrayOverThreads(threadId, preX, 0);
+    }
+
+    private void generateV(WeightsWrap1D weights, double[] v) {
         zeroOutArray(v);
         int threadRowCount = ParallelOps.threadRowCounts[threadId];
 
@@ -585,8 +637,10 @@ public class ProgramWorker {
                  ++globalCol) {
                 if (globalRow == globalCol) continue;
 
-                double origD = distances[threadLocalRow * ParallelOps
-                        .globalColCount + globalCol] * INV_SHORT_MAX;
+                double origD = distanceMatrix.get(threadLocalRow, globalCol) * INV_SHORT_MAX;
+                if (origD == 0 && globalRow != globalCol) {
+                    origD = 1.0;
+                }
 //                double weight = weights.getWeight(threadLocalRow, globalCol);
                 double weight = 1.0;
 
@@ -600,7 +654,6 @@ public class ProgramWorker {
         }
 
     }
-
 
     private void calculateConjugateGradient(
             double[] preX, int targetDimension, int numPoints, double[] BC,
@@ -771,29 +824,8 @@ public class ProgramWorker {
                 blockSize, 0, globalThreadRowRange.getStartIndex(), outMM);
     }
 
-
-    private static double innerProductCalculation(double[] a, double[] b) {
-        double sum = 0;
-        if (a.length > 0) {
-            for (int i = 0; i < a.length; ++i) {
-                sum += a[i] * b[i];
-            }
-        }
-        return sum;
-    }
-
-    private static double innerProductCalculation(double[] a) {
-        double sum = 0.0;
-        if (a.length > 0) {
-            for (double anA : a) {
-                sum += anA * anA;
-            }
-        }
-        return sum;
-    }
-
     private void calculateBC(
-            double[] preX, int targetDimension, double tCur, short[] distances,
+            double[] preX, int targetDimension, double tCur,
             WeightsWrap1D weights, int blockSize, double[] BC,
             double[][] threadPartialBCInternalBofZ,
             double[] threadPartialBCInternalMM)
@@ -801,7 +833,7 @@ public class ProgramWorker {
 
         bcTimings.startTiming(BCTimings.TimingTask.BC_INTERNAL);
         calculateBCInternal(
-                preX, targetDimension, tCur, distances, weights, blockSize,
+                preX, targetDimension, tCur, weights, blockSize,
                 threadPartialBCInternalBofZ, threadPartialBCInternalMM);
         bcTimings.endTiming(
                 BCTimings.TimingTask.BC_INTERNAL);
@@ -851,13 +883,12 @@ public class ProgramWorker {
     }
 
     private void calculateBCInternal(
-            double[] preX, int targetDimension, double tCur, short[] distances,
+            double[] preX, int targetDimension, double tCur,
             WeightsWrap1D weights, int blockSize, double[][] internalBofZ,
             double[] outMM) {
 
         bcInternalTimings.startTiming(BCInternalTimings.TimingTask.BOFZ);
-        calculateBofZ(preX, targetDimension, tCur,
-                distances, weights, internalBofZ);
+        calculateBofZ(preX, targetDimension, tCur, weights, internalBofZ);
         bcInternalTimings.endTiming(BCInternalTimings.TimingTask.BOFZ);
 
         // Next we can calculate the BofZ * preX.
@@ -868,10 +899,7 @@ public class ProgramWorker {
         bcInternalTimings.endTiming(BCInternalTimings.TimingTask.MM);
     }
 
-    private void calculateBofZ(
-            double[] preX, int targetDimension, double tCur, short[]
-            distances, WeightsWrap1D weights,
-            double[][] outBofZ) {
+    private void calculateBofZ(double[] preX, int targetDimension, double tCur, WeightsWrap1D weights, double[][] outBofZ) {
 
         int threadRowCount = globalThreadRowRange.getLength();
 
@@ -895,23 +923,25 @@ public class ProgramWorker {
             outBofZLocalRow[globalRow] = 0;
             for (int globalCol = 0; globalCol < ParallelOps.globalColCount;
                  globalCol++) {
-                 /* B_ij = - w_ij * delta_ij / d_ij(Z), if (d_ij(Z) != 0) 0,
-				 * otherwise v_ij = - w_ij.
-				 *
-				 * Therefore, B_ij = v_ij * delta_ij / d_ij(Z). 0 (if d_ij
-				 * (Z) >=
-				 * small threshold) --> the actual meaning is (if d_ij(Z) == 0)
-				 * BofZ[i][j] = V[i][j] * deltaMat[i][j] / CalculateDistance
-				 * (ref
-				 * preX, i, j);*/
+                /* B_ij = - w_ij * delta_ij / d_ij(Z), if (d_ij(Z) != 0) 0,
+                 * otherwise v_ij = - w_ij.
+                 *
+                 * Therefore, B_ij = v_ij * delta_ij / d_ij(Z). 0 (if d_ij
+                 * (Z) >=
+                 * small threshold) --> the actual meaning is (if d_ij(Z) == 0)
+                 * BofZ[i][j] = V[i][j] * deltaMat[i][j] / CalculateDistance
+                 * (ref
+                 * preX, i, j);*/
 
                 // this is for the i!=j case. For i==j case will be calculated
                 // separately (see above).
                 if (globalRow == globalCol) continue;
 
 
-                origD = distances[threadLocalRow * globalColCount +
-                        globalCol] * INV_SHORT_MAX;
+                origD = distanceMatrix.get(threadLocalRow, globalCol) * INV_SHORT_MAX;
+                if (origD == 0 && globalRow != globalCol) {
+                    origD = 1.0;
+                }
 //                weight = weights.getWeight(threadLocalRow, globalCol);
                 weight = 1.0;
 
@@ -932,46 +962,32 @@ public class ProgramWorker {
         }
     }
 
-    private static void extractPoints(
-            Bytes bytes, int numPoints, int dimension, double[] to) {
-        int pos = 0;
-        int offset;
-        for (int i = 0; i < numPoints; ++i) {
-            offset = i * dimension;
-            for (int j = 0; j < dimension; ++j) {
-                bytes.position(pos);
-                to[offset + j] = bytes.readDouble(pos);
-                pos += Double.BYTES;
+    /*private static double calculateEuclideanDist(
+        double[] v, double[] w, int targetDim) {
+        double dist = 0.0;
+        for (int k = 0; k < targetDim; k++) {
+            try {
+                double diff = v[k] - w[k];
+                dist += diff * diff;
+            } catch (IndexOutOfBoundsException e){
+                // Usually this should not happen, also this is not
+                // necessary to catch, but it was found that some parent block
+                // in HJ hides this error if/when it happens, so explicitly
+                // printing it here.
+                e.printStackTrace();
             }
         }
-    }
 
-    private static void mergePartials(double[][] partials, double[] result) {
-        int offset = 0;
-        for (double[] partial : partials) {
-            System.arraycopy(partial, 0, result, offset, partial.length);
-            offset += partial.length;
-        }
-    }
-
-    private static void mergePartials(
-            double[][] partials, Bytes result) {
-        result.position(0);
-        for (double[] partial : partials) {
-            for (double aPartial : partial) {
-                result.writeDouble(aPartial);
-            }
-        }
-    }
+        dist = Math.sqrt(dist);
+        return dist;
+    }*/
 
     private double calculateStress(
-            double[] preX, int targetDimension, double tCur, short[] distances,
+            double[] preX, int targetDimension, double tCur,
             WeightsWrap1D weights, double invSumOfSquareDist)
             throws MPIException, BrokenBarrierException, InterruptedException {
 
-        refDouble.setValue(calculateStressInternal(threadId, preX,
-                targetDimension, tCur,
-                distances, weights));
+        refDouble.setValue(calculateStressInternal(threadId, preX, targetDimension, tCur, weights));
         threadComm.sumDoublesOverThreads(threadId, refDouble);
 
         if (ParallelOps.worldProcsCount > 1 && threadId == 0) {
@@ -1023,12 +1039,9 @@ public class ProgramWorker {
         return refDouble.getValue() * invSumOfSquareDist;
     }
 
-    private double calculateStressInternal(
-            int threadIdx, double[] preX, int targetDim, double tCur, short[]
-            distances, WeightsWrap1D weights) {
+    private double calculateStressInternal(int threadIdx, double[] preX, int targetDim, double tCur, WeightsWrap1D weights) {
 
-        stressInternalTimings.startTiming(StressInternalTimings.TimingTask
-                .COMP, threadIdx);
+        stressInternalTimings.startTiming(StressInternalTimings.TimingTask.COMP, threadIdx);
         double sigma = 0.0;
         double diff = 0.0;
         if (tCur > 10E-10) {
@@ -1042,12 +1055,13 @@ public class ProgramWorker {
         int globalRow;
         double origD, weight, euclideanD;
         double heatD, tmpD;
-        for (int threadLocalRow = 0; threadLocalRow < threadRowCount;
-             ++threadLocalRow) {
+        for (int threadLocalRow = 0; threadLocalRow < threadRowCount; ++threadLocalRow) {
             globalRow = threadLocalRow + globalRowOffset;
             for (int globalCol = 0; globalCol < globalColCount; globalCol++) {
-                origD = distances[threadLocalRow * globalColCount + globalCol]
-                        * INV_SHORT_MAX;
+                origD = distanceMatrix.get(threadLocalRow, globalCol) * INV_SHORT_MAX;
+                if (origD == 0 && globalRow != globalCol) {
+                    origD = 1.0;
+                }
 //                weight = weights.getWeight(threadLocalRow, globalCol);
                 weight = 1.0;
 
@@ -1055,38 +1069,16 @@ public class ProgramWorker {
                     continue;
                 }
 
-                euclideanD = globalRow != globalCol ? calculateEuclideanDist(
-                        preX, globalRow, globalCol, targetDim) : 0.0;
+                euclideanD = globalRow != globalCol ? calculateEuclideanDist(preX, globalRow, globalCol, targetDim) : 0.0;
 
                 heatD = origD - diff;
                 tmpD = origD >= diff ? heatD - euclideanD : -euclideanD;
                 sigma += weight * tmpD * tmpD;
             }
         }
-        stressInternalTimings.endTiming(StressInternalTimings.TimingTask
-                .COMP, threadIdx);
+        stressInternalTimings.endTiming(StressInternalTimings.TimingTask.COMP, threadIdx);
         return sigma;
     }
-
-    /*private static double calculateEuclideanDist(
-        double[] v, double[] w, int targetDim) {
-        double dist = 0.0;
-        for (int k = 0; k < targetDim; k++) {
-            try {
-                double diff = v[k] - w[k];
-                dist += diff * diff;
-            } catch (IndexOutOfBoundsException e){
-                // Usually this should not happen, also this is not
-                // necessary to catch, but it was found that some parent block
-                // in HJ hides this error if/when it happens, so explicitly
-                // printing it here.
-                e.printStackTrace();
-            }
-        }
-
-        dist = Math.sqrt(dist);
-        return dist;
-    }*/
 
     public double calculateEuclideanDist(double[] v, int i, int j, int d) {
         double t = 0.0;
@@ -1110,7 +1102,8 @@ public class ProgramWorker {
                 // Use Random class for generating random initial mapping
                 // solution.
 
-                Random rand = new Random(System.currentTimeMillis());
+//                Random rand = new Random(System.currentTimeMillis());
+                Random rand = new Random(1000);
                 for (int i = 0; i < numPoints; i++) {
                     for (int j = 0; j < targetDim; j++) {
                         threadLocalFullXBytes.position(pos);
@@ -1133,13 +1126,10 @@ public class ProgramWorker {
         extractPoints(threadLocalFullXBytes, numPoints, targetDim, preX);
     }
 
-    private DoubleStatistics calculateStatistics(
-            short[] distances, WeightsWrap1D weights, RefObj<Integer>
-            missingDistCount)
+    private DoubleStatistics calculateStatistics(WeightsWrap1D weights, RefObj<Integer> missingDistCount)
             throws MPIException, BrokenBarrierException, InterruptedException {
 
-        DoubleStatistics distanceSummary =
-                calculateStatisticsInternal(distances, weights, refInt);
+        DoubleStatistics distanceSummary = calculateStatisticsInternal(weights, refInt);
         threadComm.sumDoubleStatisticsOverThreads(threadId, distanceSummary);
         threadComm.sumIntOverThreads(threadId, refInt);
 
@@ -1155,14 +1145,44 @@ public class ProgramWorker {
         return distanceSummary;
     }
 
-    private static TransformationFunction loadFunction(String classFile) {
-        ClassLoader classLoader = Program.class.getClassLoader();
-        try {
-            Class aClass = classLoader.loadClass(classFile);
-            return (TransformationFunction) aClass.newInstance();
-        } catch (ClassNotFoundException | InstantiationException |
-                IllegalAccessException e) {
-            throw new RuntimeException("Failed to load class: " + classFile, e);
+    private void readScoreMatrixAndWeight() throws MPIException {
+        int startIdx = globalThreadRowRange.getStartIndex();
+        int endIdx = globalThreadRowRange.getEndIndex();
+        int length = globalThreadRowRange.getLength();
+        Utils.allPrintln(String.format("startIdx=%d, endIdx=%d, length=%d", startIdx, endIdx, length));
+
+
+        // load score matrix
+        distanceMatrix = SparseMatrixFile.loadIntoMemory(config.sparseScoreIndexFile, config.sparseScoreDataFile, startIdx, endIdx, config.numberDataPoints);
+        double maxScore = distanceMatrix.maxPositive();
+        double minScore = distanceMatrix.minPositive();
+        Utils.allPrintln(String.format("Local: Max score = %f, Min score=%f", maxScore, minScore));
+
+        // convert score matrix to final distance matrix
+        minScore = ParallelOps.allReduceMin(minScore);
+        maxScore = ParallelOps.allReduceMax(maxScore);
+        Utils.allPrintln(String.format("Global: Max score = %f, Min score=%f", maxScore, minScore));
+        final double finalMaxScore = maxScore;
+        final double finalMinScore = minScore;
+        distanceMatrix.inPlaceTransform(new Sparse.Transform() {
+            @Override
+            public double apply(double v) {
+                return (1.0 / v - 1.0 / finalMaxScore) * finalMinScore * finalMaxScore / (finalMaxScore - finalMinScore) * SHORT_MAX;
+            }
+        });
+        Utils.allPrintln(String.format("Max distance=%f", distanceMatrix.maxPositive()));
+
+
+        weights = new WeightsWrap1D(null, null, config.isSammon, ParallelOps.globalColCount);
+    }
+
+    private void convertToSparseMatrix(short[] distances) {
+        distanceMatrix = new SparseMatrix(globalThreadRowRange.getLength(), ParallelOps.globalColCount);
+        for (int i = 0; i < globalThreadRowRange.getLength(); i++) {
+            for (int j = 0; j < ParallelOps.globalColCount; j++) {
+                double value = distances[i * ParallelOps.globalColCount + j];
+                distanceMatrix.set(i, j, value);
+            }
         }
     }
 
@@ -1176,10 +1196,11 @@ public class ProgramWorker {
                     : null);
         }
 
+        Utils.allPrintln(String.format("globalThreadRowRange.getLength():%d, ParallelOps.globalColCount:%d", globalThreadRowRange.getLength(), ParallelOps.globalColCount));
 
         int elementCount = globalThreadRowRange.getLength() * ParallelOps
                 .globalColCount;
-        distances = new short[elementCount];
+        short[] distances = new short[elementCount];
         if (config.repetitions == 1) {
             BinaryReader1D.readRowRange(config.distanceMatrixFile,
                     globalThreadRowRange, ParallelOps.globalColCount, byteOrder,
@@ -1189,6 +1210,8 @@ public class ProgramWorker {
                     globalThreadRowRange, ParallelOps.globalColCount, byteOrder,
                     true, function, config.repetitions, distances);
         }
+
+        convertToSparseMatrix(distances);
 
         if (!Strings.isNullOrEmpty(config.weightMatrixFile)) {
             short[] w = null;
@@ -1224,56 +1247,27 @@ public class ProgramWorker {
 
     }
 
-    private DoubleStatistics calculateStatisticsInternal(
-            short[] distances, WeightsWrap1D weights, RefObj<Integer>
-            refMissingDistCount) {
+    private DoubleStatistics calculateStatisticsInternal(WeightsWrap1D weights, RefObj<Integer> refMissingDistCount) {
 
         int missingDistCount = 0;
         DoubleStatistics stat = new DoubleStatistics();
-
-        int threadRowCount = ParallelOps.threadRowCounts[threadId];
-
-        double origD, weight;
-        for (int localRow = 0; localRow < threadRowCount; ++localRow) {
-            for (int globalCol = 0; globalCol < ParallelOps.globalColCount;
-                 globalCol++) {
-                origD = distances[localRow * ParallelOps.globalColCount +
-                        globalCol] * INV_SHORT_MAX;
-//                weight = weights.getWeight(localRow, globalCol);
-                weight = 1.0;
-                if (origD < 0) {
-                    // Missing distance
-                    ++missingDistCount;
-                    continue;
-                }
-                if (weight == 0) continue; // Ignore zero weights
-
-                stat.accept(origD);
+        double origD;
+        double[] values = distanceMatrix.values();
+        for (double value : values) {
+            origD = value * INV_SHORT_MAX;
+            if (origD < 0) {
+                ++missingDistCount;
+                continue;
             }
+            stat.accept(origD);
         }
+        // add diagonal zeros, otherwise statistics differ
+        for (int i = 0; i < globalThreadRowRange.getLength(); i++) {
+            stat.accept(0.0);
+        }
+
         refMissingDistCount.setValue(missingDistCount);
         return stat;
-    }
-
-
-    /**
-     * Parse command line arguments
-     *
-     * @param args Command line arguments
-     * @param opts Command line options
-     * @return An <code>Optional&lt;CommandLine&gt;</code> object
-     */
-    private static Optional<CommandLine> parseCommandLineArguments(
-            String[] args, Options opts) {
-
-        CommandLineParser optParser = new GnuParser();
-
-        try {
-            return Optional.fromNullable(optParser.parse(opts, args));
-        } catch (ParseException e) {
-            e.printStackTrace();
-        }
-        return Optional.fromNullable(null);
     }
 
 }
