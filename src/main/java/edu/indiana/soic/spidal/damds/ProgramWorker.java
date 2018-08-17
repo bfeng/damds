@@ -51,7 +51,7 @@ public class ProgramWorker {
     private DAMDSSection config;
     private ByteOrder byteOrder;
     private SparseMatrix distanceMatrix;
-    private WeightsWrap1D weights;
+    private SparseWeightWrap1D weights;
     private int BlockSize;
     private int threadId;
     private Range globalThreadRowRange;
@@ -298,6 +298,10 @@ public class ProgramWorker {
     public void run() throws IOException {
         try {
             setup();
+
+            // Allocating point arrays once for all
+            allocateArrays();
+
             Utils.allPrintln(String.format("Before read: distanceMatrix=%s", distanceMatrix));
             if (!Strings.isNullOrEmpty(config.sparseScoreIndexFile) && !Strings.isNullOrEmpty(config.sparseScoreDataFile)) {
                 readScoreMatrixAndWeight();
@@ -322,9 +326,6 @@ public class ProgramWorker {
 
             weights.setAvgDistForSammon(distanceSummary.getAverage());
 //            changeZeroDistancesToPostiveMin(distanceSummary.getPositiveMin());
-
-            // Allocating point arrays once for all
-            allocateArrays();
 
             if (Strings.isNullOrEmpty(config.initialPointsFile)) {
                 generateInitMapping(
@@ -1173,7 +1174,7 @@ public class ProgramWorker {
         Utils.allPrintln(String.format("Max distance=%f", distanceMatrix.maxPositive()));
 
 
-        weights = new WeightsWrap1D(null, null, config.isSammon, ParallelOps.globalColCount);
+        weights = new SparseWeightWrap1D(config.scoreWeight, distanceMatrix, config.isSammon, ParallelOps.globalColCount);
     }
 
     private void convertToSparseMatrix(short[] distances) {
@@ -1222,6 +1223,7 @@ public class ProgramWorker {
             if (!config.isSimpleWeights) {
                 w = new short[elementCount];
                 if (config.repetitions == 1) {
+                    Utils.allPrintln("Wrap weights");
                     BinaryReader1D.readRowRange(config.weightMatrixFile,
                             globalThreadRowRange, ParallelOps.globalColCount,
                             byteOrder, true, function, w);
@@ -1230,19 +1232,19 @@ public class ProgramWorker {
                             globalThreadRowRange, ParallelOps.globalColCount,
                             byteOrder, true, function, config.repetitions, w);
                 }
-                weights = new WeightsWrap1D(
-                        w, distances, isSammon, ParallelOps.globalColCount);
+                Utils.allPrintln("Generate warp weights");
+//                weights = new WeightsWrap1D(w, distances, isSammon, ParallelOps.globalColCount);
+                weights = new SparseWeightWrap1D(w, distances, isSammon, ParallelOps.globalColCount);
             } else {
                 double[] sw = null;
                 sw = BinaryReader2D.readSimpleFile(config.weightMatrixFile,
                         config.numberDataPoints);
-                weights = new WeightsWrap1D(sw, globalThreadRowRange,
-                        distances, isSammon, ParallelOps.globalColCount,
-                        function);
+//                weights = new WeightsWrap1D(sw, globalThreadRowRange, distances, isSammon, ParallelOps.globalColCount, function);
+                weights = new SparseWeightWrap1D(sw, globalThreadRowRange, distances, isSammon, ParallelOps.globalColCount, function);
             }
         } else {
-            weights = new WeightsWrap1D(
-                    null, distances, isSammon, ParallelOps.globalColCount);
+//            weights = new WeightsWrap1D(null, distances, isSammon, ParallelOps.globalColCount);
+            weights = new SparseWeightWrap1D(null, distances, isSammon, ParallelOps.globalColCount);
         }
 
     }
