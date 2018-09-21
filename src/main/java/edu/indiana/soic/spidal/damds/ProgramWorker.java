@@ -642,8 +642,7 @@ public class ProgramWorker {
                 if (origD == 0 && globalRow != globalCol) {
                     origD = 1.0;
                 }
-//                double weight = weights.getWeight(threadLocalRow, globalCol);
-                double weight = 1.0;
+                double weight = weights.getWeight(threadLocalRow, globalCol);
 
                 if (origD < 0 || weight == 0) {
                     continue;
@@ -943,8 +942,7 @@ public class ProgramWorker {
                 if (origD == 0 && globalRow != globalCol) {
                     origD = 1.0;
                 }
-//                weight = weights.getWeight(threadLocalRow, globalCol);
-                weight = 1.0;
+                weight = weights.getWeight(threadLocalRow, globalCol);
 
                 if (origD < 0 || weight == 0) {
                     continue;
@@ -1063,8 +1061,7 @@ public class ProgramWorker {
                 if (origD == 0 && globalRow != globalCol) {
                     origD = 1.0;
                 }
-//                weight = weights.getWeight(threadLocalRow, globalCol);
-                weight = 1.0;
+                weight = weights.getWeight(threadLocalRow, globalCol);
 
                 if (origD < 0 || weight == 0) {
                     continue;
@@ -1169,6 +1166,7 @@ public class ProgramWorker {
             @Override
             public double apply(double v) {
                 return (1.0 / v - 1.0 / finalMaxScore) * finalMinScore * finalMaxScore / (finalMaxScore - finalMinScore) * SHORT_MAX;
+//                return v / (finalMaxScore - finalMinScore) * SHORT_MAX;
             }
         });
         Utils.allPrintln(String.format("Max distance=%f", distanceMatrix.maxPositive()));
