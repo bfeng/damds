@@ -325,7 +325,7 @@ public class ProgramWorker {
                             missingDistPercent);
 
             weights.setAvgDistForSammon(distanceSummary.getAverage());
-//            changeZeroDistancesToPostiveMin(distanceSummary.getPositiveMin());
+            changeZeroDistancesToPostiveMin(distanceSummary.getPositiveMin());
 
             if (Strings.isNullOrEmpty(config.initialPointsFile)) {
                 generateInitMapping(
@@ -1100,8 +1100,8 @@ public class ProgramWorker {
                 // Use Random class for generating random initial mapping
                 // solution.
 
-//                Random rand = new Random(System.currentTimeMillis());
-                Random rand = new Random(1000);
+                Random rand = new Random(System.currentTimeMillis());
+//                Random rand = new Random(1000);
                 for (int i = 0; i < numPoints; i++) {
                     for (int j = 0; j < targetDim; j++) {
                         threadLocalFullXBytes.position(pos);
