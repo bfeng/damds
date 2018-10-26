@@ -1251,21 +1251,25 @@ public class ProgramWorker {
 
         int missingDistCount = 0;
         DoubleStatistics stat = new DoubleStatistics();
-        double origD;
-        double[] values = distanceMatrix.values();
-        for (double value : values) {
-            origD = value * INV_SHORT_MAX;
-            if (origD < 0) {
-                ++missingDistCount;
-                continue;
-            }
-            stat.accept(origD);
-        }
-        // add diagonal zeros, otherwise statistics differ
-        for (int i = 0; i < globalThreadRowRange.getLength(); i++) {
-            stat.accept(0.0);
-        }
 
+        int threadRowCount = ParallelOps.threadRowCounts[threadId];
+
+        double origD, weight;
+        for (int localRow = 0; localRow < threadRowCount; ++localRow) {
+            for (int globalCol = 0; globalCol < ParallelOps.globalColCount; globalCol++) {
+                origD = distanceMatrix.get(localRow, globalCol) * INV_SHORT_MAX;
+                weight = weights.getWeight(localRow, globalCol);
+//                weight = 1.0;
+                if (origD < 0) {
+                    // Missing distance
+                    ++missingDistCount;
+                    continue;
+                }
+                if (weight == 0) continue; // Ignore zero weights
+
+                stat.accept(origD);
+            }
+        }
         refMissingDistCount.setValue(missingDistCount);
         return stat;
     }
